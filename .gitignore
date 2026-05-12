@@ -30,3 +30,7 @@ c3.php
 
 # Composer lock file (this is a project template)
 /composer.lock
+
+.qwen/
+AGENTS.md
+CLAUDE.md
