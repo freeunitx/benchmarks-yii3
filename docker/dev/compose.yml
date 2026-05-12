@@ -4,9 +4,6 @@ services:
       dockerfile: docker/Dockerfile
       context: ..
       target: dev
-      args:
-        USER_ID: ${UID}
-        GROUP_ID: ${GID}
     env_file:
       - path: ./dev/.env
       - path: ./dev/override.env
