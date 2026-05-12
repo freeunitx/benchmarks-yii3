@@ -11,6 +11,11 @@
 - Stages: `5000 -> 10000 -> 15000 -> 20000 -> 25000 -> 30000 -> 40000 -> 50000` (по `30s`)
 - Auto VU: `PREALLOCATED_VUS=10000`, `MAX_VUS=100000`
 
+## Тестовый хост
+- Ноутбук: `12 vCPU`, `AMD Ryzen 5 5625U`
+- RAM: `8 ГБ LPDDR4` (`4266 MT/s`)
+- Диск: `M.2 NVMe 512 ГБ` (`INTEL SSDPEKNU512GZ`)
+
 ## Сводная таблица (3 теста)
 
 | Runtime | Benchmark dir | http_reqs | req/s | checks OK | checks fail | latency med | latency p95 | latency p99 | dropped_iterations | vus_max |
