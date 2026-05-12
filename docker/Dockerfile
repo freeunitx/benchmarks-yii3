@@ -3,6 +3,7 @@ FROM composer/composer:2-bin AS composer
 FROM dunglas/frankenphp:1-php8.5-bookworm AS base
 
 RUN apt update && apt -y install \
+    git \
     unzip
 
 RUN install-php-extensions \

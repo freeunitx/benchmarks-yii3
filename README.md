@@ -79,6 +79,18 @@ cd myproject
 make composer update
 ```
 
+If Composer asks for a GitHub token while syncing `yiisoft/yii-runner-frankenphp`, use:
+
+```shell
+composer install --prefer-dist
+```
+
+If your environment still hits GitHub API limits, configure OAuth once:
+
+```shell
+composer config -g github-oauth.github.com <TOKEN>
+```
+
 To run the app:
 
 ```shell
@@ -111,6 +123,23 @@ steady mode it uses `RATE`; for ramp mode it uses the highest target found in `S
 set VU counts manually, but both variables still work as explicit overrides. The default heuristic is intentionally
 aggressive and now prefers lower dropped-iteration rates over conservative VU usage. `AUTO_MAX_VUS_LIMIT` may be used
 as a higher or lower automatic safety ceiling when needed.
+
+### Running multiple stacks simultaneously
+
+Each runtime stack (e.g. FreeUnit, FrankenPHP classic, FrankenPHP worker) needs its own port to run in parallel.
+FreeUnit and FrankenPHP each ship with their own `Caddyfile` and entry point; FreeUnit defaults to port `9991`.
+To run a second stack alongside it, override the port:
+
+```shell
+# Second stack on port 9992
+DEV_PORT=9992 make up
+
+# Benchmark the second stack
+BASE_URL=http://localhost:9992 make bench BENCH_NAME="FrankenPHP worker"
+```
+
+Results from all runs are aggregated by `make bench-report`. The output directory for each run embeds the
+`BENCH_NAME` value, so different stacks do not overwrite each other.
 
 Examples:
 

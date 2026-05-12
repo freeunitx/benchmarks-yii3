@@ -75,7 +75,17 @@ endif
 
 ifeq ($(PRIMARY_GOAL),composer)
 composer: ## Run Composer.
-	$(DOCKER_COMPOSE_DEV) run --rm app composer $(CLI_ARGS)
+	$(DOCKER_COMPOSE_DEV) run --rm \
+		--user root \
+		-e HOST_UID=$(UID) \
+		-e HOST_GID=$(GID) \
+		-e COMPOSER_CACHE_DIR=/tmp/composer-cache \
+		app sh -lc 'set -eu; \
+			git config --global --add safe.directory /app || true; \
+			mkdir -p /app/vendor /app/runtime/cache/composer /tmp/composer-cache; \
+			chown -R "$${HOST_UID}:$${HOST_GID}" /app/vendor /app/runtime /tmp/composer-cache; \
+			composer $(CLI_ARGS); \
+			chown -R "$${HOST_UID}:$${HOST_GID}" /app/vendor /app/runtime /tmp/composer-cache'
 endif
 
 ifeq ($(PRIMARY_GOAL),rector)
@@ -153,8 +163,8 @@ endif
 #
 
 ifeq ($(PRIMARY_GOAL),bench)
-bench: ## Run home benchmark. Options: BENCH_NAME="..." MODE=steady|ramp CAPTURE_METRICS=1 RATE=... STAGES=... PREALLOCATED_VUS=... MAX_VUS=... DOCKER_STATS_APP_SERVICES="app" DOCKER_STATS_SERVICES="postgres valkey" K6_LOG_OUTPUT=none|stderr
-	BASE_URL=http://localhost:9991 \
+bench: ## Run home benchmark. Options: BENCH_NAME="..." BASE_URL=... MODE=steady|ramp CAPTURE_METRICS=1 RATE=... STAGES=... PREALLOCATED_VUS=... MAX_VUS=... DOCKER_STATS_APP_SERVICES="app" DOCKER_STATS_SERVICES="postgres valkey" K6_LOG_OUTPUT=none|stderr
+	BASE_URL=$${BASE_URL:-http://localhost:9991} \
 	TARGET_PATH=/ \
 	TARGET_NAME=home \
 	BENCH_NAME="$(BENCH_NAME)" \
@@ -164,8 +174,8 @@ bench: ## Run home benchmark. Options: BENCH_NAME="..." MODE=steady|ramp CAPTURE
 endif
 
 ifeq ($(PRIMARY_GOAL),bench-db)
-bench-db: ## Run PostgreSQL benchmark. Options: BENCH_NAME="..." MODE=steady|ramp CAPTURE_METRICS=1 RATE=... STAGES=... PREALLOCATED_VUS=... MAX_VUS=... DOCKER_STATS_APP_SERVICES="app" DOCKER_STATS_SERVICES="postgres valkey" K6_LOG_OUTPUT=none|stderr
-	BASE_URL=http://localhost:9991 \
+bench-db: ## Run PostgreSQL benchmark. Options: BENCH_NAME="..." BASE_URL=... MODE=steady|ramp CAPTURE_METRICS=1 RATE=... STAGES=... PREALLOCATED_VUS=... MAX_VUS=... DOCKER_STATS_APP_SERVICES="app" DOCKER_STATS_SERVICES="postgres valkey" K6_LOG_OUTPUT=none|stderr
+	BASE_URL=$${BASE_URL:-http://localhost:9991} \
 	TARGET_PATH=/postgres/orders \
 	TARGET_NAME=postgres-orders \
 	BENCH_NAME="$(BENCH_NAME) DB" \
