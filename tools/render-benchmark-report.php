@@ -2,26 +2,28 @@
 
 declare(strict_types=1);
 
-[$outputFile, $runDirectories] = parseArguments($argv);
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    [$outputFile, $runDirectories] = parseArguments($argv);
 
-$runs = [];
-foreach ($runDirectories as $runDirectory) {
-    $runs[] = loadRun($runDirectory);
+    $runs = [];
+    foreach ($runDirectories as $runDirectory) {
+        $runs[] = loadRun($runDirectory);
+    }
+
+    $outputDirectory = dirname($outputFile);
+    if (!is_dir($outputDirectory) && !mkdir($outputDirectory, 0775, true) && !is_dir($outputDirectory)) {
+        fwrite(STDERR, "Unable to create output directory: $outputDirectory\n");
+        exit(1);
+    }
+
+    $html = renderHtmlReport($runs);
+    if (file_put_contents($outputFile, $html) === false) {
+        fwrite(STDERR, "Unable to write report: $outputFile\n");
+        exit(1);
+    }
+
+    echo $outputFile . PHP_EOL;
 }
-
-$outputDirectory = dirname($outputFile);
-if (!is_dir($outputDirectory) && !mkdir($outputDirectory, 0775, true) && !is_dir($outputDirectory)) {
-    fwrite(STDERR, "Unable to create output directory: $outputDirectory\n");
-    exit(1);
-}
-
-$html = renderHtmlReport($runs);
-if (file_put_contents($outputFile, $html) === false) {
-    fwrite(STDERR, "Unable to write report: $outputFile\n");
-    exit(1);
-}
-
-echo $outputFile . PHP_EOL;
 
 function parseArguments(array $argv): array
 {
@@ -108,7 +110,7 @@ function isRunDirectory(string $directory): bool
     return is_file($directory . '/metadata.env')
         && is_file($directory . '/summary.json')
         && is_file($directory . '/docker-stats.csv')
-        && is_file($directory . '/k6-timeseries.json');
+        && is_file($directory . '/wrkx-timeseries.json');
 }
 
 function loadRun(string $runDirectory): array
@@ -121,9 +123,9 @@ function loadRun(string $runDirectory): array
     $metadataFile = $runDirectory . '/metadata.env';
     $summaryFile = $runDirectory . '/summary.json';
     $dockerStatsFile = $runDirectory . '/docker-stats.csv';
-    $k6TimeseriesFile = $runDirectory . '/k6-timeseries.json';
+    $wrkxTimeseriesFile = $runDirectory . '/wrkx-timeseries.json';
 
-    foreach ([$metadataFile, $summaryFile, $dockerStatsFile, $k6TimeseriesFile] as $requiredFile) {
+    foreach ([$metadataFile, $summaryFile, $dockerStatsFile, $wrkxTimeseriesFile] as $requiredFile) {
         if (!is_file($requiredFile)) {
             fwrite(STDERR, "Required benchmark file not found: $requiredFile\n");
             exit(1);
@@ -132,25 +134,28 @@ function loadRun(string $runDirectory): array
 
     $metadata = parseMetadata($metadataFile);
     $summary = json_decode((string) file_get_contents($summaryFile), true, 512, JSON_THROW_ON_ERROR);
-    $k6Series = parseCompactK6Timeseries($k6TimeseriesFile);
+    $wrkxSeries = parseCompactWrkxTimeseries($wrkxTimeseriesFile);
     $dockerSeries = parseDockerStats($dockerStatsFile);
-    $successfulResponsesPerSecond = $k6Series['successfulResponsesPerSecond'];
+    $successfulResponsesPerSecond = $wrkxSeries['successfulResponsesPerSecond'];
     $targetRequestsPerSecond = buildTargetRequestsPerSecondSeries($metadata);
-    $issuedRequestsPerSecond = $k6Series['issuedRequestsPerSecond'];
+    $issuedRequestsPerSecond = $wrkxSeries['issuedRequestsPerSecond'];
     $erroredRequestsPerSecond = deriveErroredRequestsSeries(
-        $k6Series['requestsPerSecond'],
+        $wrkxSeries['requestsPerSecond'],
         $successfulResponsesPerSecond,
     );
     $rpsCap = detectRpsCap(
         $issuedRequestsPerSecond,
         $successfulResponsesPerSecond,
-        $k6Series['avgLatencyMs'],
-        $k6Series['p95LatencyMs'],
+        $wrkxSeries['avgLatencyMs'],
+        $wrkxSeries['p95LatencyMs'],
     );
+    if (($summary['schema'] ?? '') === 'wrkx-summary-v1') {
+        $rpsCap = detectStageRpsCap($summary['runs'] ?? [], $successfulResponsesPerSecond);
+    }
     $runSummary = summarizeRun(
         $summary,
-        $k6Series['avgLatencyMs'],
-        $k6Series['p95LatencyMs'],
+        $wrkxSeries['avgLatencyMs'],
+        $wrkxSeries['p95LatencyMs'],
         $rpsCap,
     );
     $runSummary['rpsCap'] = $rpsCap;
@@ -167,15 +172,15 @@ function loadRun(string $runDirectory): array
         'metadata' => $metadata,
         'summary' => $runSummary,
         'series' => [
-            'requestsPerSecond' => $k6Series['requestsPerSecond'],
+            'requestsPerSecond' => $wrkxSeries['requestsPerSecond'],
             'issuedRequestsPerSecond' => $issuedRequestsPerSecond,
             'successfulResponsesPerSecond' => $successfulResponsesPerSecond,
             'erroredRequestsPerSecond' => $erroredRequestsPerSecond,
             'targetRequestsPerSecond' => $targetRequestsPerSecond,
-            'avgLatencyMs' => $k6Series['avgLatencyMs'],
-            'p95LatencyMs' => $k6Series['p95LatencyMs'],
-            'droppedPerSecond' => $k6Series['droppedPerSecond'],
-            'virtualUsers' => $k6Series['virtualUsers'],
+            'avgLatencyMs' => $wrkxSeries['avgLatencyMs'],
+            'p95LatencyMs' => $wrkxSeries['p95LatencyMs'],
+            'droppedPerSecond' => $wrkxSeries['droppedPerSecond'],
+            'connections' => $wrkxSeries['connections'],
         ],
         'docker' => $dockerSeries,
     ];
@@ -205,13 +210,56 @@ function summarizeRun(
         ? (int) ($rpsCap['second'] ?? 0)
         : null;
 
+    $normalEndSecond = $capSecond;
+    if (($summary['schema'] ?? '') === 'wrkx-summary-v1') {
+        $deteriorationSecond = detectStageLatencyDeterioration($avgLatencyMsSeries, $p95LatencyMsSeries);
+        if ($deteriorationSecond !== null) {
+            $normalEndSecond = $normalEndSecond === null
+                ? $deteriorationSecond
+                : min($normalEndSecond, $deteriorationSecond);
+        }
+    }
+
     return [
-        'latencyAvgMs' => averageSeriesUntilSecond($avgLatencyMsSeries, $capSecond),
-        'latencyP95Ms' => averageSeriesUntilSecond($p95LatencyMsSeries, $capSecond),
+        'normalLatencyAvgMs' => averageSeriesInRange($avgLatencyMsSeries, null, $normalEndSecond),
+        'normalLatencyP95Ms' => averageSeriesInRange($p95LatencyMsSeries, null, $normalEndSecond),
+        'overloadedLatencyAvgMs' => $capSecond === null ? null : averageSeriesInRange($avgLatencyMsSeries, $capSecond, $capSecond + 1),
+        'overloadedLatencyP95Ms' => $capSecond === null ? null : averageSeriesInRange($p95LatencyMsSeries, $capSecond, $capSecond + 1),
     ];
 }
 
-function averageSeriesUntilSecond(array $points, ?int $untilSecondExclusive): float
+/** A stage aggregate already covers a sustained measurement interval. */
+function detectStageLatencyDeterioration(array $avgLatencyMsSeries, array $p95LatencyMsSeries): ?int
+{
+    $avgBySecond = indexSeriesBySecond($avgLatencyMsSeries);
+    $p95BySecond = indexSeriesBySecond($p95LatencyMsSeries);
+    ksort($avgBySecond, SORT_NUMERIC);
+    $baselineSecond = array_key_first($avgBySecond);
+    if ($baselineSecond === null) {
+        return null;
+    }
+
+    $baselineAvg = $avgBySecond[$baselineSecond];
+    $baselineP95 = $p95BySecond[$baselineSecond] ?? null;
+    // Use the same baseline-relative thresholds as the per-second surge detector.
+    foreach ($avgBySecond as $second => $avg) {
+        if ($second === $baselineSecond || $avg < max(20.0, $baselineAvg + 12.0, $baselineAvg * 4.0)) {
+            continue;
+        }
+        if ($baselineP95 !== null) {
+            $p95 = $p95BySecond[$second] ?? null;
+            if ($p95 === null || $p95 < max(30.0, $baselineP95 + 15.0, $baselineP95 * 2.5)) {
+                continue;
+            }
+        }
+
+        return (int) $second;
+    }
+
+    return null;
+}
+
+function averageSeriesInRange(array $points, ?int $fromSecondInclusive, ?int $untilSecondExclusive): ?float
 {
     $filteredPoints = [];
 
@@ -221,18 +269,15 @@ function averageSeriesUntilSecond(array $points, ?int $untilSecondExclusive): fl
         }
 
         $second = (int) $point['x'];
-        if ($untilSecondExclusive !== null && $second >= $untilSecondExclusive) {
+        if (($fromSecondInclusive !== null && $second < $fromSecondInclusive)
+            || ($untilSecondExclusive !== null && $second >= $untilSecondExclusive)) {
             continue;
         }
 
         $filteredPoints[] = $point;
     }
 
-    if ($filteredPoints === [] && $untilSecondExclusive !== null) {
-        $filteredPoints = $points;
-    }
-
-    return averageSeriesValue($filteredPoints);
+    return $filteredPoints === [] ? null : averageSeriesValue($filteredPoints);
 }
 
 function averageSeriesValue(array $points): float
@@ -254,6 +299,30 @@ function averageSeriesValue(array $points): float
     }
 
     return $count > 0 ? ($sum / $count) : 0.0;
+}
+
+/** Stage aggregates cannot satisfy the consecutive-second latency detector. */
+function detectStageRpsCap(array $stages, array $successfulSeries): array
+{
+    foreach ($stages as $index => $stage) {
+        $target = (float) ($stage['targetRate'] ?? 0);
+        $duration = (float) ($stage['durationUs'] ?? 0) / 1_000_000;
+        if ($target <= 0 || $duration <= 0) {
+            continue;
+        }
+        $successful = max(0, $stage['requests'] - $stage['errors']) / $duration;
+        // Allow normal calibration and measurement noise; require a 5% shortfall.
+        if ($successful < $target * 0.95) {
+            return [
+                'reached' => true,
+                'second' => (int) ($successfulSeries[$index]['x'] ?? 0),
+                'baselineRps' => $target,
+                'successfulRps' => $successful,
+                'basis' => 'target',
+            ];
+        }
+    }
+    return ['reached' => false];
 }
 
 function detectRpsCap(
@@ -525,18 +594,23 @@ function buildRunLabel(string $runDirectory, array $metadata): string
 {
     $benchmarkName = trim((string) ($metadata['BENCH_NAME'] ?? ''));
     if ($benchmarkName !== '') {
-        return $benchmarkName;
+        // Preserve labels for results recorded before the worker mode was named explicitly.
+        return match ($benchmarkName) {
+            'Rapira' => 'Rapira worker',
+            'Rapira DB' => 'Rapira worker DB',
+            default => $benchmarkName,
+        };
     }
 
     return basename($runDirectory);
 }
 
-function parseCompactK6Timeseries(string $file): array
+function parseCompactWrkxTimeseries(string $file): array
 {
     $payload = json_decode((string) file_get_contents($file), true, 512, JSON_THROW_ON_ERROR);
 
-    if (($payload['schema'] ?? '') !== 'compact-k6-timeseries-v1') {
-        fwrite(STDERR, "Unsupported compact k6 timeseries schema: $file\n");
+    if (($payload['schema'] ?? '') !== 'compact-wrkx-timeseries-v1') {
+        fwrite(STDERR, "Unsupported compact wrkx timeseries schema: $file\n");
         exit(1);
     }
 
@@ -548,12 +622,12 @@ function parseCompactK6Timeseries(string $file): array
         'avgLatencyMs',
         'p95LatencyMs',
         'droppedPerSecond',
-        'virtualUsers',
+        'connections',
     ];
 
     foreach ($requiredSeries as $seriesName) {
         if (!array_key_exists($seriesName, $series)) {
-            fwrite(STDERR, "Required k6 series missing in $file: $seriesName\n");
+            fwrite(STDERR, "Required wrkx series missing in $file: $seriesName\n");
             exit(1);
         }
     }
@@ -596,12 +670,11 @@ function deriveErroredRequestsSeries(array $requestsPerSecond, array $successful
 
 function buildTargetRequestsPerSecondSeries(array $metadata): array
 {
-    $benchScript = (string) ($metadata['BENCH_SCRIPT'] ?? '');
+    $mode = (string) ($metadata['MODE'] ?? 'steady');
     $timeUnitSeconds = max(1, parseDurationSeconds((string) ($metadata['TIME_UNIT'] ?? '1s')));
 
-    if ($benchScript === 'bench-ramp.js') {
+    if ($mode === 'ramp') {
         return buildRampTargetRequestsPerSecondSeries(
-            (int) ($metadata['START_RATE'] ?? 0),
             (string) ($metadata['STAGES'] ?? '[]'),
             $timeUnitSeconds,
         );
@@ -617,18 +690,14 @@ function buildTargetRequestsPerSecondSeries(array $metadata): array
     ];
 }
 
-function buildRampTargetRequestsPerSecondSeries(int $startRate, string $stagesJson, int $timeUnitSeconds): array
+function buildRampTargetRequestsPerSecondSeries(string $stagesJson, int $timeUnitSeconds): array
 {
     $stages = json_decode($stagesJson, true);
     if (!is_array($stages)) {
         return [];
     }
 
-    $points = [
-        ['x' => 0, 'y' => (float) ($startRate / $timeUnitSeconds)],
-    ];
-
-    $currentRate = (float) $startRate;
+    $points = [];
     $currentSecond = 0;
 
     foreach ($stages as $stage) {
@@ -636,20 +705,14 @@ function buildRampTargetRequestsPerSecondSeries(int $startRate, string $stagesJs
             continue;
         }
 
-        $targetRate = (float) ($stage['target'] ?? $currentRate);
+        $targetRate = (float) ($stage['target'] ?? 0);
         $durationSeconds = max(1, parseDurationSeconds((string) ($stage['duration'] ?? '0s')));
-
-        for ($offset = 1; $offset <= $durationSeconds; $offset++) {
-            $progress = $offset / $durationSeconds;
-            $interpolatedRate = $currentRate + (($targetRate - $currentRate) * $progress);
-            $points[] = [
-                'x' => $currentSecond + $offset,
-                'y' => $interpolatedRate / $timeUnitSeconds,
-            ];
-        }
-
+        $points[] = ['x' => $currentSecond, 'y' => $targetRate / $timeUnitSeconds];
         $currentSecond += $durationSeconds;
-        $currentRate = $targetRate;
+    }
+
+    if ($points !== []) {
+        $points[] = ['x' => $currentSecond, 'y' => $points[array_key_last($points)]['y']];
     }
 
     return $points;
@@ -712,17 +775,32 @@ function parseDockerStats(string $dockerStatsFile): array
         }
 
         $service = (string) ($record['service'] ?? 'unknown');
+        $service = match ($service) {
+            'frankenphp-classic', 'frankenphp-worker', 'roadrunner',
+            'php', 'nginx', 'freeunit', 'rapira', 'rapira-classic', 'rapira-dispatcher' => 'app',
+            default => $service,
+        };
         $second = max(0, (int) floor($timestamp - $firstTimestamp));
 
-        $services[$service]['cpuPercent'][] = [
-            'x' => $second,
-            'y' => (float) ($record['cpu_percent'] ?? 0.0),
-        ];
-        $services[$service]['memoryMiB'][] = [
-            'x' => $second,
-            'y' => round(((float) ($record['memory_usage_bytes'] ?? 0.0)) / 1024 / 1024, 4),
-        ];
+        // A stack such as PHP-FPM + Nginx has multiple samples per timestamp.
+        $services[$service]['cpuPercent'][$second] = ($services[$service]['cpuPercent'][$second] ?? 0.0)
+            + (float) ($record['cpu_percent'] ?? 0.0);
+        $services[$service]['memoryMiB'][$second] = ($services[$service]['memoryMiB'][$second] ?? 0.0)
+            + (float) ($record['memory_usage_bytes'] ?? 0.0) / 1024 / 1024;
     }
+
+    foreach ($services as &$metrics) {
+        foreach ($metrics as &$samples) {
+            ksort($samples, SORT_NUMERIC);
+            $points = [];
+            foreach ($samples as $second => $value) {
+                $points[] = ['x' => $second, 'y' => round($value, 4)];
+            }
+            $samples = $points;
+        }
+        unset($samples);
+    }
+    unset($metrics);
 
     return $services;
 }
@@ -730,106 +808,123 @@ function parseDockerStats(string $dockerStatsFile): array
 function renderHtmlReport(array $runs): string
 {
     $palette = [
-        '#d1495b',
-        '#00798c',
-        '#edae49',
-        '#30638e',
-        '#66a182',
-        '#9c6644',
-        '#6a4c93',
-        '#ef476f',
+        '#e6194b', // Red.
+        '#4363d8', // Blue.
+        '#008000', // Green.
+        '#f58200', // Orange.
+        '#911eb4', // Purple.
+        '#009eae', // Cyan.
+        '#000000', // Black.
+        '#b59b00', // Mustard.
+        '#f032e6', // Magenta.
+        '#9a6324', // Brown.
+        '#73a800', // Lime.
+        '#70899f', // Slate.
     ];
-    $latencyChartMax = determineLatencyChartMax($runs);
-
-    $chartDefinitions = [
-        [
-            'id' => 'requests-per-second',
-            'title' => 'Request Rate Per Second',
-            'series' => array_merge(
-                collectRunSeries($runs, 'issuedRequestsPerSecond', $palette, ' issued', false, [2, 4]),
-                withStartMarkers(collectRunSeries($runs, 'successfulResponsesPerSecond', $palette, ' successful')),
-                collectRunSeries($runs, 'erroredRequestsPerSecond', $palette, ' errored', false, [8, 4]),
-            ),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'styleLegend' => [
-                ['label' => 'successful', 'dash' => []],
-                ['label' => 'issued', 'dash' => [2, 4]],
-                ['label' => 'errored', 'dash' => [8, 4]],
-            ],
-            'format' => 'integer',
-            'smoothingWindow' => 5,
-        ],
-        [
-            'id' => 'latency',
-            'title' => 'Latency (ms)',
-            'series' => array_merge(
-                collectRunSeries($runs, 'avgLatencyMs', $palette, ' avg'),
-                collectRunSeries($runs, 'p95LatencyMs', $palette, ' p95', false, [8, 4]),
-            ),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'styleLegend' => [
-                ['label' => 'avg', 'dash' => []],
-                ['label' => 'p95', 'dash' => [8, 4]],
-            ],
-            'format' => 'milliseconds-integer',
-            'smoothingWindow' => 5,
-            'yMax' => $latencyChartMax,
-        ],
-        [
-            'id' => 'dropped-iterations',
-            'title' => 'Load Generator Dropped Iterations Per Second',
-            'series' => collectRunSeries($runs, 'droppedPerSecond', $palette),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'format' => 'integer',
-        ],
-        [
-            'id' => 'virtual-users',
-            'title' => 'Virtual Users',
-            'series' => collectRunSeries($runs, 'virtualUsers', $palette),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'format' => 'integer',
-        ],
+    $allRuns = $runs;
+    $groups = [
+        'worker-home' => ['Worker no DB', false, ['FrankenPHP worker', 'RoadRunner', 'Rapira worker', 'Rapira dispatcher']],
+        'worker-db' => ['Worker DB', true, ['FrankenPHP worker', 'RoadRunner', 'Rapira worker', 'Rapira dispatcher']],
+        'non-worker-home' => ['Non-worker no DB', false, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit']],
+        'non-worker-db' => ['Non-worker DB', true, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit']],
     ];
-
-    foreach (collectDockerServices($runs) as $serviceName) {
-        $chartDefinitions[] = [
-            'id' => 'cpu-' . $serviceName,
-            'title' => strtoupper($serviceName) . ' CPU (% of one core, 100% = 1 core)',
-            'series' => collectDockerSeries($runs, $serviceName, 'cpuPercent', $palette),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'format' => 'percent-integer',
-            'smoothingWindow' => 5,
-        ];
-        $chartDefinitions[] = [
-            'id' => 'memory-' . $serviceName,
-            'title' => strtoupper($serviceName) . ' Memory (MiB)',
-            'series' => collectDockerSeries($runs, $serviceName, 'memoryMiB', $palette),
-            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
-            'format' => 'integer',
-        ];
+    $chartDefinitions = [];
+    $included = [];
+    foreach ($groups as $groupId => [$title, $database, $names]) {
+        $groupRuns = array_filter($allRuns, static function (array $run) use ($database, $names): bool {
+            $name = preg_replace('/ DB$/', '', $run['label']);
+            return isDatabaseRun($run) === $database && in_array($name, $names, true);
+        });
+        $included += $groupRuns;
+        foreach (buildChartDefinitions($groupRuns, $palette) as $chart) {
+            $chart['id'] = $groupId . '-' . $chart['id'];
+            $chart['group'] = $title;
+            $chartDefinitions[] = $chart;
+        }
+    }
+    // Keep optional runtimes visible without mixing them into the requested comparisons.
+    $otherRuns = array_diff_key($allRuns, $included);
+    foreach (buildChartDefinitions($otherRuns, $palette) as $chart) {
+        $chart['id'] = 'other-' . $chart['id'];
+        $chart['group'] = 'Other runtimes';
+        $chartDefinitions[] = $chart;
     }
 
     $reportData = [
         'charts' => $chartDefinitions,
     ];
 
-    $summaryRows = '';
-    foreach ($runs as $index => $run) {
+    $summaryRows = ['home' => '', 'db' => ''];
+    $summaryRuns = $runs;
+    uasort($summaryRuns, static function (array $left, array $right): int {
+        $leftCap = $left['summary']['rpsCap'] ?? [];
+        $rightCap = $right['summary']['rpsCap'] ?? [];
+        $leftReached = (bool) ($leftCap['reached'] ?? false);
+        $rightReached = (bool) ($rightCap['reached'] ?? false);
+        return ($rightReached <=> $leftReached)
+            ?: ($leftReached ? $rightCap['successfulRps'] <=> $leftCap['successfulRps'] : 0);
+    });
+    foreach ($summaryRuns as $index => $run) {
         $summary = $run['summary'];
+        $capReached = $summary['rpsCap']['reached'] ?? false;
+        $successfulRps = $capReached ? (float) $summary['rpsCap']['successfulRps'] : null;
+        $targetRps = $capReached
+            ? (float) ($summary['rpsCap']['baselineRps'] ?? $summary['rpsCap']['issuedRps'] ?? 0.0)
+            : null;
+        $latencyCells = '';
+        foreach (['normalLatencyAvgMs', 'normalLatencyP95Ms', 'overloadedLatencyAvgMs', 'overloadedLatencyP95Ms'] as $metric) {
+            $value = $summary[$metric] ?? null;
+            $latencyCells .= '<td data-sort-value="' . ($value ?? '') . '">'
+                . ($value === null ? '—' : formatMilliseconds($value)) . '</td>';
+        }
         $runColor = $palette[$index % count($palette)];
         $runLabel = h($run['label']);
-        $summaryRows .= '<tr>'
+        $summaryRows[isDatabaseRun($run) ? 'db' : 'home'] .= '<tr>'
             . '<td><span class="summary-run"><span class="legend-swatch" style="background:' . h($runColor) . '"></span>' . $runLabel . '</span></td>'
             . '<td>' . h($run['metadata']['TARGET_PATH'] ?? '') . '</td>'
-            . '<td>' . h($run['metadata']['BENCH_SCRIPT'] ?? '') . '</td>'
-            . '<td>' . h(formatRpsCap($summary['rpsCap'] ?? ['reached' => false])) . '</td>'
-            . '<td>' . formatMilliseconds($summary['latencyAvgMs']) . '</td>'
-            . '<td>' . formatMilliseconds($summary['latencyP95Ms']) . '</td>'
+            . '<td data-sort-value="' . ($successfulRps ?? '') . '">' . ($successfulRps === null ? 'Not reached' : formatInteger((int) round($successfulRps))) . '</td>'
+            . '<td data-sort-value="' . ($targetRps ?? '') . '">' . ($targetRps === null ? 'Not reached' : formatInteger((int) round($targetRps))) . '</td>'
+            . $latencyCells
             . '</tr>';
     }
 
+    $summarySections = '';
+    foreach (['home' => 'Non-DB', 'db' => 'DB'] as $key => $summaryTitle) {
+        $rows = $summaryRows[$key];
+        $summarySections .= <<<HTML
+    <section class="panel">
+      <h2>Run Summary — {$summaryTitle}</h2>
+      <p>Normal latency averages samples before a detected latency surge or throughput cap, whichever comes first. Overloaded latency comes from the throughput-cap sample shown in the RPS columns. Runs may include different load levels in their normal averages, so these are not equal-load comparisons. Mean p95 averages the included sample percentiles, not pooled requests. — means no qualifying measurement.</p>
+      <details>
+        <summary>Calculation details</summary>
+        <p>For stage data, each sample represents one load stage. The first stage provides the latency baseline. A surge is detected when average latency reaches the largest of 20 ms, 4× baseline average latency, or baseline average latency + 12 ms. When baseline p95 is available, the stage must also have a p95 reaching the largest of 30 ms, 2.5× baseline p95, or baseline p95 + 15 ms. These thresholds are a heuristic, not a latency guarantee.</p>
+        <p>Normal averages exclude the first qualifying surge stage and all later stages, or stop earlier at the throughput cap. If the cap occurs in the first stage, no normal measurement is available. If no cap is reached, no overloaded measurement is available. For per-second data, the existing sustained latency-surge detector determines the cutoff, and averages use per-second samples.</p>
+      </details>
+      <table class="summary-table">
+        <thead>
+          <tr>
+            <th scope="col" aria-sort="none" data-sort-type="text"><button type="button">Run</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="text"><button type="button">Path</button></th>
+            <th scope="col" aria-sort="descending" data-sort-type="number"><button type="button">Successful RPS</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="number"><button type="button">Target RPS</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="number"><button type="button">Normal latency (avg)</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="number"><button type="button">Normal latency (mean p95)</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="number"><button type="button">Overloaded latency (avg)</button></th>
+            <th scope="col" aria-sort="none" data-sort-type="number"><button type="button">Overloaded latency (p95)</button></th>
+          </tr>
+        </thead>
+        <tbody>
+          {$rows}
+        </tbody>
+      </table>
+    </section>
+HTML;
+    }
+
     $metadataBlocks = '';
-    foreach ($runs as $run) {
+    $metadataRuns = $runs;
+    usort($metadataRuns, static fn(array $left, array $right): int => strcasecmp($left['label'], $right['label']));
+    foreach ($metadataRuns as $run) {
         $items = '';
         foreach ($run['metadata'] as $key => $value) {
             $items .= '<tr><th>' . h($key) . '</th><td>' . h($value) . '</td></tr>';
@@ -847,7 +942,12 @@ HTML;
     }
 
     $chartSections = '';
+    $lastGroup = null;
     foreach ($chartDefinitions as $chart) {
+        if ($chart['group'] !== $lastGroup) {
+            $chartSections .= '<h2>' . h($chart['group']) . '</h2>';
+            $lastGroup = $chart['group'];
+        }
         $chartId = h($chart['id']);
         $chartTitle = h($chart['title']);
         $styleLegendHtml = '';
@@ -1021,6 +1121,10 @@ HTML;
       color: var(--muted);
       width: 15%;
     }
+    .summary-table th button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; text-align: left; }
+    .summary-table th button::after { content: ' ↕'; }
+    .summary-table th[aria-sort="ascending"] button::after { content: ' ↑'; }
+    .summary-table th[aria-sort="descending"] button::after { content: ' ↓'; }
     .chart-panel {
       overflow: hidden;
     }
@@ -1067,6 +1171,26 @@ HTML;
       align-items: center;
       gap: 8px;
     }
+    button.legend-item {
+      font: inherit;
+      color: inherit;
+      background: transparent;
+      border: 0;
+      border-radius: 4px;
+      padding: 4px;
+      cursor: pointer;
+    }
+    .legend-item.is-dimmed {
+      opacity: 0.3;
+    }
+    .legend-item.is-highlighted {
+      color: var(--text);
+      box-shadow: 0 0 0 2px currentColor;
+    }
+    .legend-item:focus-visible {
+      outline: 2px solid var(--text);
+      outline-offset: 3px;
+    }
     .summary-run {
       display: inline-flex;
       align-items: center;
@@ -1097,9 +1221,10 @@ HTML;
     .meta-grid {
       display: grid;
       gap: 20px;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
     @media (max-width: 720px) {
+      .meta-grid { grid-template-columns: 1fr; }
       main { padding: 20px 14px 36px; }
       h1 { font-size: 1.8rem; }
       .panel { padding: 16px; }
@@ -1113,28 +1238,12 @@ HTML;
   <main class="grid">
     <section class="panel">
       <h1>Benchmark Report</h1>
-      <p>Generated {$generatedAt}. This report combines k6 summary and time-series data with Docker CPU and memory samples.</p>
-      <p>Request rate, latency, and CPU charts use a 5s moving average over faint raw samples. RPS cap and Errors start still use raw data.</p>
+      <p>Generated {$generatedAt}. This report combines wrkx stage summaries with Docker CPU and memory samples.</p>
+      <p>Charts show raw samples. For stage results, RPS cap marks the first stage with successful throughput more than 5% below target; per-second results use a sustained latency surge. The load generator can also limit throughput.</p>
+      <p>Hover over a chart legend label or focus it with Tab to highlight that run.</p>
     </section>
 
-    <section class="panel">
-      <h2>Run Summary</h2>
-      <table class="summary-table">
-        <thead>
-          <tr>
-            <th>Run</th>
-            <th>Path</th>
-            <th>Script</th>
-            <th>RPS Cap</th>
-            <th>Avg Latency</th>
-            <th>P95 Latency</th>
-          </tr>
-        </thead>
-        <tbody>
-          {$summaryRows}
-        </tbody>
-      </table>
-    </section>
+    {$summarySections}
 
     {$chartSections}
 
@@ -1190,10 +1299,10 @@ HTML;
         return Math.round(value) + '%';
       }
       if (format === 'milliseconds-integer') {
-        return Math.round(value) + ' ms';
+        return String(Math.round(value));
       }
       if (format === 'milliseconds') {
-        return fixed(value, 2) + ' ms';
+        return fixed(value, 2);
       }
       return trimZeros(fixed(value, 2));
     }
@@ -1261,7 +1370,10 @@ HTML;
     }
 
     function formatTargetTickLabel(chart, xValue) {
-      const targetSeries = (chart.xAxisTargetSeries || []).filter((item) => item.points.length > 0);
+      // Finished runs must not keep contributing their last target to later stages.
+      const targetSeries = (chart.xAxisTargetSeries || []).filter((item) =>
+        item.points.length > 1 && xValue >= item.points[0].x && xValue < item.points[item.points.length - 1].x
+      );
       if (targetSeries.length === 0) {
         return '';
       }
@@ -1315,7 +1427,9 @@ HTML;
       const width = cssWidth - margin.left - margin.right;
       const height = cssHeight - margin.top - margin.bottom;
 
-      const yValues = displaySeries.flatMap((item) => item.displayPoints.map((point) => point.y));
+      const yValues = displaySeries
+        .filter((item) => item.affectsYAxis !== false)
+        .flatMap((item) => item.displayPoints.map((point) => point.y));
       const xMin = globalXAxisDomain.min;
       const xMax = globalXAxisDomain.max;
       const rawYMax = Math.max(...yValues);
@@ -1343,14 +1457,19 @@ HTML;
       ctx.textBaseline = 'top';
       ctx.textAlign = 'center';
       ctx.font = '12px Menlo, Consolas, monospace';
-      for (let i = 0; i <= X_AXIS_TICK_DIVISIONS; i++) {
-        const x = margin.left + (width / X_AXIS_TICK_DIVISIONS) * i;
+      const stageTicks = [...new Set((chart.xAxisTargetSeries || [])
+        .flatMap((item) => item.points.slice(0, -1).map((point) => point.x)))].sort((a, b) => a - b);
+      const ticks = stageTicks.length > 1 ? stageTicks : Array.from(
+        { length: X_AXIS_TICK_DIVISIONS + 1 },
+        (_, i) => xMin + ((xMax - xMin) / X_AXIS_TICK_DIVISIONS) * i
+      );
+      for (const value of ticks) {
+        const x = margin.left + ((value - xMin) / Math.max(1, xMax - xMin)) * width;
         ctx.beginPath();
         ctx.moveTo(x, margin.top);
         ctx.lineTo(x, margin.top + height);
         ctx.stroke();
 
-        const value = xMin + ((xMax - xMin) / X_AXIS_TICK_DIVISIONS) * i;
         ctx.fillText(formatElapsedSeconds(value), x, margin.top + height + 10);
 
         const targetLabel = formatTargetTickLabel(chart, value);
@@ -1371,13 +1490,27 @@ HTML;
       const toCanvasY = (y) => margin.top + height - (y / yMax) * height;
       const startMarkerSeries = displaySeries.filter((item) => item.startMarker);
 
-      displaySeries.forEach((item) => {
+      const highlightedRun = legend.dataset.highlightedRun || null;
+      const isHighlighted = (item) => (item.runLabel || item.label) === highlightedRun;
+      const opacity = (item) => highlightedRun && !isHighlighted(item) ? 0.12 : 1;
+      // Draw the highlighted run last so overlapping lines cannot hide it.
+      const orderedSeries = [...displaySeries].sort((a, b) => Number(isHighlighted(a)) - Number(isHighlighted(b)));
+
+      // Keep issued rates above the response-based scale inside the plot area.
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(margin.left, margin.top, width, height);
+      ctx.clip();
+
+      orderedSeries.forEach((item) => {
         if (smoothingWindow > 1) {
-          drawLine(ctx, toCanvasX, toCanvasY, item.points, item.color, item.dash, 1.2, 0.22);
+          drawLine(ctx, toCanvasX, toCanvasY, item.points, item.color, item.dash, 1.2, 0.22 * opacity(item));
         }
 
-        drawLine(ctx, toCanvasX, toCanvasY, item.displayPoints, item.color, item.dash, 2.2, 1);
+        drawLine(ctx, toCanvasX, toCanvasY, item.displayPoints, item.color, item.dash, isHighlighted(item) ? 4 : 2.2, opacity(item));
 
+        ctx.save();
+        ctx.globalAlpha = opacity(item);
         if (chart.showPoints || item.showPoints) {
           ctx.fillStyle = item.color;
           item.displayPoints.forEach((point) => {
@@ -1388,14 +1521,20 @@ HTML;
             ctx.fill();
           });
         }
+        ctx.restore();
       });
 
-      displaySeries.forEach((item) => {
+      orderedSeries.forEach((item) => {
+        ctx.save();
+        ctx.globalAlpha = opacity(item);
         drawMarker(ctx, toCanvasX, toCanvasY, item.displayPoints, item.capSecond, item.color, 'circle');
         drawMarker(ctx, toCanvasX, toCanvasY, item.displayPoints, item.errorStartSecond, item.color, 'cross');
+        ctx.restore();
       });
 
       startMarkerSeries.forEach((item, markerIndex) => {
+        ctx.save();
+        ctx.globalAlpha = opacity(item);
         drawStartMarker(
           ctx,
           toCanvasX,
@@ -1405,7 +1544,10 @@ HTML;
           markerIndex,
           startMarkerSeries.length,
         );
+        ctx.restore();
       });
+
+      ctx.restore();
 
       const runs = [];
       const seenRuns = new Set();
@@ -1421,11 +1563,49 @@ HTML;
         });
       });
 
-      legend.innerHTML = runs.map((item) => (
-        '<span class="legend-item"><span class="legend-swatch" style="background:' + item.color + '"></span>' +
-        item.label +
-        '</span>'
-      )).join('');
+      if (legend.childElementCount === 0) {
+        let hoveredRun = null;
+        let focusedRun = null;
+        const updateHighlight = () => {
+          legend.dataset.highlightedRun = hoveredRun || focusedRun || '';
+          drawChart(canvasId, legendId, chart);
+        };
+
+        runs.sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }));
+        runs.forEach((item) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'legend-item';
+          button.dataset.runLabel = item.label;
+          const swatch = document.createElement('span');
+          swatch.className = 'legend-swatch';
+          swatch.style.background = item.color;
+          swatch.setAttribute('aria-hidden', 'true');
+          button.append(swatch, document.createTextNode(item.label));
+          button.addEventListener('mouseenter', () => {
+            hoveredRun = item.label;
+            updateHighlight();
+          });
+          button.addEventListener('mouseleave', () => {
+            hoveredRun = null;
+            updateHighlight();
+          });
+          button.addEventListener('focus', () => {
+            focusedRun = item.label;
+            updateHighlight();
+          });
+          button.addEventListener('blur', () => {
+            focusedRun = null;
+            updateHighlight();
+          });
+          legend.append(button);
+        });
+      }
+
+      legend.querySelectorAll('.legend-item').forEach((button) => {
+        button.classList.toggle('is-highlighted', button.dataset.runLabel === highlightedRun);
+        button.classList.toggle('is-dimmed', highlightedRun !== null && button.dataset.runLabel !== highlightedRun);
+      });
     }
 
     function render() {
@@ -1538,12 +1718,107 @@ HTML;
       ctx.restore();
     }
 
+    document.querySelectorAll('.summary-table').forEach((table) => {
+      table.querySelectorAll('thead th').forEach((header, column) => {
+        header.querySelector('button').addEventListener('click', () => {
+          const ascending = header.getAttribute('aria-sort') !== 'ascending';
+          table.querySelectorAll('thead th').forEach((item) => item.setAttribute('aria-sort', 'none'));
+          header.setAttribute('aria-sort', ascending ? 'ascending' : 'descending');
+          const rows = Array.from(table.tBodies[0].rows);
+          const numeric = header.dataset.sortType === 'number';
+          rows.sort((a, b) => {
+            const value = (row) => row.cells[column].dataset.sortValue ?? row.cells[column].textContent.trim();
+            const left = value(a), right = value(b);
+            // Missing measurements stay last in either direction.
+            if (left === '' || right === '') return (left === '') - (right === '');
+            const order = numeric ? Number(left) - Number(right) : left.localeCompare(right);
+            return ascending ? order : -order;
+          });
+          table.tBodies[0].append(...rows);
+        });
+      });
+    });
+
     window.addEventListener('resize', render);
     render();
   </script>
 </body>
 </html>
 HTML;
+}
+
+function buildChartDefinitions(array $runs, array $palette): array
+{
+    if ($runs === []) {
+        return [];
+    }
+    $latencyChartMax = determineLatencyChartMax($runs);
+
+    $chartDefinitions = [
+        [
+            'id' => 'requests-per-second',
+            'title' => 'Request Rate Per Second',
+            'series' => array_merge(
+                collectRunSeries($runs, 'issuedRequestsPerSecond', $palette, ' issued', false, [2, 4]),
+                withStartMarkers(collectRunSeries($runs, 'successfulResponsesPerSecond', $palette, ' successful')),
+                collectRunSeries($runs, 'erroredRequestsPerSecond', $palette, ' errored', false, [8, 4]),
+            ),
+            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
+            'styleLegend' => [
+                ['label' => 'successful', 'dash' => []],
+                ['label' => 'issued', 'dash' => [2, 4]],
+                ['label' => 'errored', 'dash' => [8, 4]],
+            ],
+            'format' => 'integer',
+            'smoothingWindow' => 0,
+        ],
+        [
+            'id' => 'latency',
+            'title' => 'Latency (ms)',
+            'series' => array_merge(
+                collectRunSeries($runs, 'avgLatencyMs', $palette, ' avg'),
+                collectRunSeries($runs, 'p95LatencyMs', $palette, ' p95', false, [8, 4]),
+            ),
+            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
+            'styleLegend' => [
+                ['label' => 'avg', 'dash' => []],
+                ['label' => 'p95', 'dash' => [8, 4]],
+            ],
+            'format' => 'milliseconds-integer',
+            'smoothingWindow' => 0,
+            'yMax' => $latencyChartMax,
+        ],
+    ];
+
+    foreach (collectDockerServices($runs) as $serviceName) {
+        if (in_array($serviceName, ['postgres', 'valkey'], true)) {
+            continue;
+        }
+
+        $chartDefinitions[] = [
+            'id' => 'cpu-' . $serviceName,
+            'title' => strtoupper($serviceName) . ' CPU (% of one core, 100% = 1 core)',
+            'series' => collectDockerSeries($runs, $serviceName, 'cpuPercent', $palette),
+            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
+            'format' => 'percent-integer',
+            'smoothingWindow' => 0,
+        ];
+        $chartDefinitions[] = [
+            'id' => 'memory-' . $serviceName,
+            'title' => strtoupper($serviceName) . ' Memory (MiB)',
+            'series' => collectDockerSeries($runs, $serviceName, 'memoryMiB', $palette),
+            'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
+            'format' => 'integer',
+        ];
+    }
+
+    return $chartDefinitions;
+}
+
+function isDatabaseRun(array $run): bool
+{
+    return ($run['metadata']['TARGET_NAME'] ?? '') === 'postgres-orders'
+        || ($run['metadata']['TARGET_PATH'] ?? '') === '/postgres/orders';
 }
 
 function collectRunSeries(
@@ -1568,6 +1843,7 @@ function collectRunSeries(
             'runLabel' => $run['label'],
             'color' => $palette[$index % count($palette)],
             'runIndex' => $index,
+            'affectsYAxis' => $metric !== 'issuedRequestsPerSecond',
             'points' => $points,
             'showPoints' => $showPoints,
             'dash' => $dash,
@@ -1726,24 +2002,6 @@ function formatPercent(float $value): string
 function formatMilliseconds(float $value): string
 {
     return sprintf('%.2F ms', $value);
-}
-
-function formatRpsCap(array $rpsCap): string
-{
-    if (($rpsCap['reached'] ?? false) !== true) {
-        return 'Not reached';
-    }
-
-    $second = (int) ($rpsCap['second'] ?? 0);
-    $issuedRps = (int) round((float) ($rpsCap['baselineRps'] ?? $rpsCap['issuedRps'] ?? 0.0));
-    $successfulRps = (int) round((float) ($rpsCap['successfulRps'] ?? 0.0));
-
-    return sprintf(
-        '%s @ %s issued / %s successful',
-        formatElapsedSecondsForSummary($second),
-        formatInteger($issuedRps),
-        formatInteger($successfulRps),
-    );
 }
 
 function formatErrorsStart(array $errorsStart): string

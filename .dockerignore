@@ -5,6 +5,8 @@
 
 !/docker/dev/unit-config.json
 !/docker/prod/unit-config.json
+!/docker/**/Caddyfile
+!/docker/runtimes/**
 !/config
 !/public
 !/src
@@ -12,6 +14,8 @@
 !autoload.php
 !configuration.php
 !yii
+!worker-frankenphp.php
+!worker-roadrunner.php
 !composer.json
 !composer.lock
 !.env*

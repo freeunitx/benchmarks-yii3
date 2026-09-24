@@ -1,234 +1,303 @@
-<p align="center">
-    <a href="https://github.com/yiisoft" target="_blank">
-        <img src="https://yiisoft.github.io/docs/images/yii_logo.svg" height="100px" alt="Yii">
-    </a>
-    <h1 align="center">Yii API application</h1>
-    <h3 align="center">An application template for a new API project</h3>
-    <br>
-</p>
+# Yii3 application-server benchmarks
 
-[![Latest Stable Version](https://poser.pugx.org/yiisoft/app-api/v)](https://packagist.org/packages/yiisoft/app-api)
-[![Total Downloads](https://poser.pugx.org/yiisoft/app-api/downloads)](https://packagist.org/packages/yiisoft/app-api)
-[![build](https://github.com/yiisoft/app-api/actions/workflows/build.yml/badge.svg)](https://github.com/yiisoft/app-api/actions/workflows/build.yml)
-[![Code Coverage](https://codecov.io/gh/yiisoft/app-api/branch/master/graph/badge.svg)](https://codecov.io/gh/yiisoft/app-api)
-[![static analysis](https://github.com/yiisoft/app-api/workflows/static%20analysis/badge.svg)](https://github.com/yiisoft/app-api/actions?query=workflow%3A%22static+analysis%22)
-[![type-coverage](https://shepherd.dev/github/yiisoft/app-api/coverage.svg)](https://shepherd.dev/github/yiisoft/app-api)
-[![psalm-level](https://shepherd.dev/github/yiisoft/app-api/level.svg)](https://shepherd.dev/github/yiisoft/app-api)
+This repository measures the same Yii3 API application on several PHP application servers under repeatable,
+constant-throughput HTTP load. All runtime implementations live together on `master`, use the same application code,
+database seed, benchmark client, and report generator, and can be run individually or as one batch.
 
-<p>
-    <a href="https://github.com/yiisoft/app-api" target="_blank">
-        <img src="screenshot.png" alt="API request result">
-    </a>
-</p>
+The suite is intended for comparing runtime behavior—not for declaring a universally fastest server. Results depend
+on the host, Docker version, CPU scheduling, runtime configuration, request rate, and benchmark duration. Compare runs
+made on the same machine with the same settings and minimal background activity.
 
-The package is an API application template. If you need console only or classic web please start with corresponding
-templates:
+## What is included
 
-- [Console application template](https://github.com/yiisoft/app-console)
-- [Web application template](https://github.com/yiisoft/app)
+| Runtime key | Application server | Execution model |
+| --- | --- | --- |
+| `frankenphp-classic` | FrankenPHP | A normal PHP application bootstrap for each request |
+| `frankenphp-worker` | FrankenPHP | A persistent Yii worker |
+| `roadrunner` | RoadRunner | A persistent Yii worker managed by RoadRunner |
+| `php-fpm` | PHP-FPM + Nginx | Traditional FastCGI processes behind Nginx |
+| `freeunit` | FreeUnit | PHP application hosted by FreeUnit; grouped with non-worker runtimes |
+| `rapira` | Rapira worker | A persistent Yii worker using [yii-runner-rapira](https://github.com/yiisoft/yii-runner-rapira) |
+| `rapira-classic` | Rapira classic | A fresh Yii application per request; grouped with non-worker runtimes |
+| `rapira-dispatcher` | Rapira dispatcher | A persistent Yii application using Rapira exchanges; grouped with worker runtimes |
+
+Every runtime is an isolated Docker Compose profile defined in `docker/benchmarks.compose.yml`. Each run receives its
+own PostgreSQL and Valkey containers and uses the same source tree mounted at `/app`. The PostgreSQL database is seeded
+from `docker/postgres/initdb.d/10-benchmark.sql`.
+
+The runtime configs use a production-oriented benchmark baseline:
+
+- All runtimes start 20 PHP execution workers. FrankenPHP worker mode reserves one additional thread for
+  non-worker requests. PHP-FPM uses a static pool, avoiding worker ramp-up during measurement.
+- Every PHP image loads `php.ini-production` plus `docker/runtimes/php-production.ini`: OPcache is enabled
+  for web and CLI SAPIs, JIT is disabled, errors go to stderr, and PHP memory is limited to 256 MiB.
+- OPcache timestamp validation is disabled. **Restart the runtime after changing PHP files**, including
+  files in the mounted source tree. The benchmark suite rebuilds and restarts each runtime automatically.
+- FPM, FreeUnit, Rapira and FrankenPHP workers recycle after 10,000 requests; RoadRunner uses its
+  memory supervisor. API body limits are 8 MiB, and request/queue timeouts are configured where supported.
+- HTTP readiness checks gate benchmark startup. Containers have a 45-second shutdown grace period,
+  bounded Docker logs, and an increased open-file limit. Nginx access logging is disabled to match the
+  other servers, while errors remain logged. FastCGI keepalive is intentionally disabled so idle Nginx
+  connections cannot reserve the smaller FPM worker pool.
+- Each endpoint receives a separate unmeasured warm-up before load and resource samples are recorded.
+
+These are production-like application-server settings for a controlled local benchmark. HTTP on port 9991,
+bind-mounted application code, disposable database storage and benchmark credentials remain intentional;
+a deployed service still needs its own TLS ingress, secrets and persistent database storage. Worker counts
+must be sized for the deployment's CPU and memory budget. Historical results use the configs in effect when
+they were recorded and must be rerun to compare this baseline.
+
+Server releases checked on 2026-09-22 are pinned in the benchmark Dockerfile and Compose file:
+
+| Component | Version |
+| --- | --- |
+| PHP / PHP-FPM | [8.5.10](https://www.php.net/downloads.php) |
+| FrankenPHP | [1.12.7](https://github.com/php/frankenphp/releases/tag/v1.12.7) |
+| RoadRunner | [2025.1.15](https://github.com/roadrunner-server/roadrunner/releases/tag/v2025.1.15) |
+| FreeUnit | [1.36.1](https://github.com/freeunitorg/freeunit/releases/tag/1.36.1) |
+| Rapira (all modes) | [0.8.1](https://github.com/rapira-rs/rapira/releases/tag/v0.8.1) |
+| Nginx | [1.31.6 (mainline)](https://nginx.org/en/download.html) |
+| PostgreSQL | [18.6](https://www.postgresql.org/support/versioning/) |
+| Valkey | [9.1.2](https://github.com/valkey-io/valkey/releases/tag/9.1.2) |
+
+FreeUnit's published `latest-php8.5` image still contains 1.35.5. Its build target therefore compiles
+the checksummed 1.36.1 release source against PHP 8.5.10, with TLS and compression support. Optional
+JavaScript routing and OpenTelemetry modules are not built; the benchmark does not use them.
+Version pins should be refreshed from upstream releases when updating the benchmark baseline.
+
+Two endpoints are benchmarked:
+
+- `/` measures framework and runtime overhead with a minimal response.
+- `/postgres/orders` measures a database-backed request that reads joined `orders` and `customers` rows through
+  `yiisoft/db-pgsql` and persistent PDO connections.
+
+Load is generated by a pinned build of [wrkx](https://github.com/devhands-io/wrkx), a maintained wrk2 derivative with
+constant-throughput load and coordinated-omission-aware latency recording. Docker CPU and memory usage are sampled
+alongside the HTTP results.
 
 ## Requirements
 
-- PHP 8.2 - 8.5.
+- Linux with Docker Engine and the Docker Compose v2 plugin.
+- GNU Make and Bash.
+- Git for contributing.
+- Enough available CPU, memory, disk space, and time to build all runtime images.
+- Port `9991` available on the host.
 
-## Installation
+PHP, Composer, wrkx, PostgreSQL, and Valkey do not need to be installed on the host for benchmark runs. The first run
+is slower because Docker must download and build the runtime images; later runs reuse cached layers.
 
-### Local installation
+## Quick start
 
-If you do not have [Composer](https://getcomposer.org/), you may install it by following the instructions
-at [getcomposer.org](https://getcomposer.org/doc/00-intro.md).
-
-Create a project:
-
-```shell
-composer create-project yiisoft/app-api myproject
-cd myproject
-```
-
-> [!NOTE]
-> Ensure that Composer is executed with the same PHP version that will be used to run the application.
-
-Copy the example environment file and adjust as needed:
+Clone the repository and run the complete matrix:
 
 ```shell
-cp .env.example .env
+git clone git@github.com:Yii3-Benchmarks/app-api.git
+cd app-api
+make bench-all
 ```
 
-To run the app:
+This command sequentially:
+
+1. Builds and starts each runtime with isolated PostgreSQL and Valkey services.
+2. Waits for the stack and endpoint preflight check to succeed.
+3. Benchmarks `/` and `/postgres/orders` with wrkx.
+4. Captures application, database, and cache resource usage.
+5. Stops the stack and removes its volumes before moving to the next runtime.
+6. Generates one self-contained HTML report for the complete suite.
+
+Results are written to a timestamped directory:
+
+```text
+runtime/benchmarks/<timestamp>-suite/
+├── <timestamp>-<runtime>-<target>-<mode>/
+│   ├── metadata.env
+│   ├── summary.json
+│   ├── wrkx-timeseries.json
+│   ├── wrkx-*.log
+│   └── docker-stats.csv
+└── report.html
+```
+
+## Running selected benchmarks
+
+Benchmark one runtime and the minimal endpoint:
 
 ```shell
-./yii serve
+make bench RUNTIME=roadrunner MODE=steady RATE=8000 DURATION=60s
 ```
 
-Now you should be able to access the application through the URL printed to console.
-Usually it is `http://localhost:8080`.
-
-> [!TIP]
-> The `.env` file is for local development only and is excluded from version control.
-> In production, configure environment variables via your server or container instead.
-
-### Installation with Docker
-
-> [!WARNING]
-> Docker compose version 2.24 or above is required.
-
-Fork the repository, clone it, then:
+Benchmark its PostgreSQL endpoint:
 
 ```shell
-cd myproject
-make composer update
+make bench-db RUNTIME=php-fpm MODE=steady RATE=4000 DURATION=60s
 ```
 
-To run the app:
+Benchmark all Rapira modes on both endpoints:
 
 ```shell
-make up
+make bench-all RUNTIMES="rapira rapira-classic rapira-dispatcher"
 ```
 
-To stop the app:
+All Rapira modes use the pinned `0.8.1-php8.5` server image and the same `worker-rapira.php` entry point.
+The Yii runner detects the configured mode: classic handles one request per application bootstrap, while worker
+and dispatcher keep the application in memory. `rapira` continues to select worker mode.
+Its Yii runner and PHP contract currently
+require development packages; Composer records their exact revisions in the local lock file.
+
+Run a subset of runtimes through both endpoints:
 
 ```shell
-make down
+make bench-all RUNTIMES="frankenphp-worker roadrunner freeunit"
 ```
 
-The application is available at `https://localhost`.
-
-The benchmarkable PostgreSQL endpoint is available at `/postgres/orders`. It reads recent joined rows from seeded
-`orders` and `customers` tables through `yiisoft/db-pgsql` using a persistent PDO connection.
-
-Use `make bench` to benchmark `/` only, and `make bench-db` to benchmark `/postgres/orders` only. The latter gives an
-isolated RPS number for the database-backed endpoint.
-
-Both targets accept `BENCH_NAME="..."`, `MODE=steady|ramp` and `CAPTURE_METRICS=0|1`. The default benchmark name is
-`FrankenPHP classic`. When `CAPTURE_METRICS=1`, the run stores time-series metrics in `runtime/benchmarks/`:
-`k6-timeseries.json` for compact request/latency/failure series, `summary.json` for the aggregate k6 summary,
-`docker-stats.csv` for container CPU and memory samples, and `metadata.env` for the exact run settings.
-Runtime k6 warnings are suppressed by default with `K6_LOG_OUTPUT=none` so a failing target does not flood the
-console; use `K6_LOG_OUTPUT=stderr` to restore k6 log output when debugging.
-
-By default, the benchmark runner auto-sizes `PREALLOCATED_VUS` and `MAX_VUS` from the configured request rate. For
-steady mode it uses `RATE`; for ramp mode it uses the highest target found in `STAGES`. You normally do not need to
-set VU counts manually, but both variables still work as explicit overrides. The default heuristic is intentionally
-aggressive and now prefers lower dropped-iteration rates over conservative VU usage. `AUTO_MAX_VUS_LIMIT` may be used
-as a higher or lower automatic safety ceiling when needed.
-
-Examples:
+The underlying suite script also accepts a target subset:
 
 ```shell
-make bench
-make bench-db RATE=8000
-make bench MODE=ramp
-make bench-db MODE=ramp CAPTURE_METRICS=1
-make bench-db BENCH_NAME="FrankenPHP worker" MODE=ramp CAPTURE_METRICS=1
-make bench PREALLOCATED_VUS=500 MAX_VUS=3000
+RUNTIMES="roadrunner freeunit" TARGETS="home" MODE=steady RATE=5000 DURATION=60s \
+    ./tools/run-benchmark-suite.sh
 ```
 
-To turn one or more captured runs into a self-contained HTML report with graphs for RPS, failure rate, latency, dropped
-iterations, CPU, and memory:
+To start a runtime without benchmarking it:
 
 ```shell
-make bench-report
-make bench-report runtime/benchmarks
-make bench-report runtime/benchmarks/<run-dir>
-make bench-report runtime/benchmarks/<run-dir-1> runtime/benchmarks/<run-dir-2>
+make runtime-up RUNTIME=frankenphp-worker
+curl http://localhost:9991/
+curl http://localhost:9991/postgres/orders
+make runtime-down RUNTIME=frankenphp-worker
 ```
 
-Other make commands are available in the `Makefile` and can be listed with:
+`runtime-down` removes the selected runtime's database and cache volumes. Do not use it if you need to preserve manual
+changes made inside those benchmark containers.
+
+## Benchmark configuration
+
+The default mode is `ramp`. Configuration is passed as Make variables or environment variables.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUNTIME` | `frankenphp-classic` | Runtime used by `make bench` and `make bench-db` |
+| `RUNTIMES` | all eight runtimes | Space-separated runtimes used by `make bench-all` |
+| `TARGETS` | `home postgres-orders` | Space-separated endpoint keys for the suite script |
+| `MODE` | `ramp` | `steady` for one rate or `ramp` for sequential rate stages |
+| `RATE` | `10000` | Requests per second in steady mode |
+| `DURATION` | `160s` | Steady-mode duration |
+| `THREADS` | host CPU count | wrkx worker threads |
+| `CONNECTIONS` | `256` | Concurrent HTTP connections |
+| `WARMUP_DURATION` | `10s` | Unmeasured warm-up per endpoint; `0s` disables it |
+| `WARMUP_RATE` | `1000` | Requests per second during warm-up |
+| `STAGES` | thirteen stages from 2.5k to 200k RPS | JSON stage list for ramp mode |
+| `OUTPUT_ROOT` | timestamped suite directory | Result destination |
+
+Example custom ramp:
 
 ```shell
-make help
+STAGES='[{"target":1000,"duration":"30s"},{"target":3000,"duration":"30s"}]' \
+    make bench RUNTIME=freeunit MODE=ramp
 ```
 
-## Directory structure
+wrkx does not change rate continuously during a run. Ramp mode executes each `STAGES` entry as a separate
+constant-rate run and records one aggregate point per stage. wrkx uses an initial calibration period, so stages shorter
+than 20 seconds are not recommended.
 
-The application template has the following structure:
+## Reports
 
-```
-config/                     Configuration files.
-    common/                 Common configuration and DI definitions.
-    console/                Console-specific configuration.
-    environments/           Environment-specific configuration (dev/test/prod).
-    web/                    Web-specific configuration.
-docker/                     Docker-specific files.
-public/                     Files publically accessible from the Internet.
-    index.php               Entry script.
-runtime/                    Files generated during runtime.
-src/                        Application source code.
-    Api/                    API action handlers and API-specific code.
-        Shared/             Shared API components (middleware, presenters, factories).
-    Console/                Console commands.
-    Shared/                 Code shared between API and console applications.
-    bootstrap.php           Application bootstrap (autoloading, environment setup).
-    Environment.php         Environment configuration class.
-tests/                      A set of Codeception tests for the application.
-    Api/                    API endpoints tests.
-    Console/                Console command tests.
-    Functional/             Functional tests.
-    Unit/                   Unit tests.
-vendor/                     Installed Composer packages.
-Makefile                    Config for make command.
-yii                         Console application entry point.
-```
+The generated HTML report compares issued and successful RPS, errors, average and p95 latency,
+application CPU, and application memory. Charts are grouped into worker/non-worker and DB/non-DB comparisons.
+DB and non-DB summary tables show Successful RPS and Target RPS at the cap in separate sortable columns,
+sorted by Successful RPS descending by default, with unreached caps last. Stage-based runs mark the first stage more than 5% below target as the cap; this can
+reflect server or load-generator saturation. The default ramp extends to 200k RPS to test beyond the old 50k ceiling.
+It is self-contained and can be opened directly in a browser or attached to an issue.
 
-## Testing
-
-The template comes with ready to use [Codeception](https://codeception.com/) configuration.
-To execute tests, in local installation run:
+Regenerate a report from existing results:
 
 ```shell
-./vendor/bin/codecept build
-
-APP_ENV=test ./yii serve > ./runtime/yii.log 2>&1 &
-./vendor/bin/codecept run
+make bench-report INPUT=runtime/benchmarks/<suite-directory>
 ```
 
-For Docker:
+Combine explicitly selected runs:
 
 ```shell
-make codecept build
-make codecept run
+make bench-report INPUT="runtime/benchmarks/<run-1> runtime/benchmarks/<run-2>"
 ```
 
-The Docker environment also starts PostgreSQL and seeds realistic benchmark data from
-`docker/postgres/initdb.d/10-benchmark.sql`. To regenerate that dump:
+Raw wrkx output and exact run settings are retained next to the compact data. Include them when reporting unexpected
+results; an HTML chart alone is usually insufficient to reproduce a finding.
+
+## Repository structure
+
+```text
+benchmark/                      wrkx image and Lua result adapter
+config/, public/, src/          shared Yii3 API application
+docker/benchmarks.compose.yml   isolated benchmark services and runtime profiles
+docker/runtimes/                runtime images and server configuration
+docker/postgres/initdb.d/       reproducible PostgreSQL benchmark data
+tools/run-benchmark-suite.sh    multi-runtime orchestration and cleanup
+tools/run-wrkx-benchmark.sh     one endpoint/stage benchmark runner
+tools/compile-wrkx-results.php  wrkx output normalization
+tools/render-benchmark-report.* HTML report generator
+worker-frankenphp.php           FrankenPHP persistent worker entry point
+worker-roadrunner.php           RoadRunner persistent worker entry point
+worker-rapira.php               Rapira entry point for all three modes
+```
+
+The remaining application-template Docker files support development and tests. The benchmark matrix specifically uses
+`docker/benchmarks.compose.yml` and `docker/runtimes/`.
+
+## Testing changes
+
+Install or update project dependencies through the development container when needed:
 
 ```shell
-make generate-pgsql-dump
+make composer-update
 ```
 
-## Static analysis
-
-The code is statically analyzed with [Psalm](https://psalm.dev/). To run static analysis:
+Run the automated checks relevant to your change:
 
 ```shell
-./vendor/bin/psalm
+make test
+docker compose -f docker/benchmarks.compose.yml --profile roadrunner config --quiet
+bash -n tools/run-benchmark-suite.sh tools/run-wrkx-benchmark.sh
 ```
 
-or, using Docker:
+Before submitting benchmark-related changes, run at least one short steady benchmark for the affected runtime. Use a
+duration of 20 seconds or more so wrkx calibration is meaningful:
 
 ```shell
-make psalm
+make bench RUNTIME=roadrunner MODE=steady RATE=100 DURATION=20s THREADS=2 CONNECTIONS=8
 ```
 
-## Support
+Changes that affect shared application behavior should be checked against every runtime with `make bench-all` when
+practical.
 
-If you need help or have a question, check out [Yii Community Resources](https://www.yiiframework.com/community).
+## Contributing
+
+Contributions are welcome for runtime upgrades, new application servers, benchmark correctness, reporting, and
+reproducibility improvements.
+
+1. Create a branch from `master`.
+2. Keep shared application behavior identical across runtimes. Runtime-specific code belongs in `docker/runtimes/` or
+   a clearly named worker entry point.
+3. Add or update tests and documentation with the implementation.
+4. Run the checks above and record the exact smoke benchmark command you used.
+5. Open a pull request describing the motivation, affected runtimes, validation performed, and any compatibility or
+   performance tradeoffs. Do not present performance changes without the host and benchmark configuration.
+
+### Adding a runtime
+
+To add another application server:
+
+1. Add a named build target to `docker/runtimes/Dockerfile` and its configuration under `docker/runtimes/`.
+2. Add a matching profile and service to `docker/benchmarks.compose.yml`, exposing the application on host port
+   `9991`.
+3. Add the runtime key, readable label, and resource-sampled service names to `tools/run-benchmark-suite.sh`.
+4. Add required PHP packages to `composer.json`; keep one shared lock file.
+5. Add the runtime to the `RUNTIMES` default in `Makefile` and to the table in this README.
+6. Verify `/` and `/postgres/orders`, run a short steady benchmark, and confirm report generation and automatic
+   teardown.
+
+Avoid committing generated benchmark output unless it is intentionally used as a published reference result. Never
+change only one runtime's application logic to improve its score—the suite must compare equivalent work.
 
 ## License
 
-The Yii3 API template is free software. It is released under the terms of the BSD License.
-Please see [`LICENSE`](./LICENSE.md) for more information.
-
-Maintained by [Yii Software](https://www.yiiframework.com/).
-
-## Support the project
-
-[![Open Collective](https://img.shields.io/badge/Open%20Collective-sponsor-7eadf1?logo=open%20collective&logoColor=7eadf1&labelColor=555555)](https://opencollective.com/yiisoft)
-
-## Follow updates
-
-[![Official website](https://img.shields.io/badge/Powered_by-Yii_Framework-green.svg?style=flat)](https://www.yiiframework.com/)
-[![Twitter](https://img.shields.io/badge/twitter-follow-1DA1F2?logo=twitter&logoColor=1DA1F2&labelColor=555555?style=flat)](https://twitter.com/yiiframework)
-[![Telegram](https://img.shields.io/badge/telegram-join-1DA1F2?style=flat&logo=telegram)](https://t.me/yii3en)
-[![Facebook](https://img.shields.io/badge/facebook-join-1DA1F2?style=flat&logo=facebook&logoColor=ffffff)](https://www.facebook.com/groups/yiitalk)
-[![Slack](https://img.shields.io/badge/slack-join-1DA1F2?style=flat&logo=slack)](https://yiiframework.com/go/slack)
+The project is released under the BSD-3-Clause License. See [LICENSE.md](LICENSE.md).
