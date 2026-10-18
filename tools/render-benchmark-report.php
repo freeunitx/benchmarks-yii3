@@ -594,8 +594,10 @@ function buildRunLabel(string $runDirectory, array $metadata): string
 {
     $benchmarkName = trim((string) ($metadata['BENCH_NAME'] ?? ''));
     if ($benchmarkName !== '') {
-        // Preserve labels for results recorded before the worker mode was named explicitly.
+        // Normalize historical labels without changing the recorded measurements.
         return match ($benchmarkName) {
+            'RoadRunner' => 'RoadRunner v2025',
+            'RoadRunner DB' => 'RoadRunner v2025 DB',
             'Rapira' => 'Rapira worker',
             'Rapira DB' => 'Rapira worker DB',
             default => $benchmarkName,
@@ -776,8 +778,8 @@ function parseDockerStats(string $dockerStatsFile): array
 
         $service = (string) ($record['service'] ?? 'unknown');
         $service = match ($service) {
-            'frankenphp-classic', 'frankenphp-worker', 'roadrunner',
-            'php', 'nginx', 'freeunit', 'rapira', 'rapira-classic', 'rapira-dispatcher' => 'app',
+            'frankenphp-classic', 'frankenphp-worker', 'roadrunner', 'roadrunner-v3',
+            'php', 'nginx', 'freeunit', 'rapira', 'rapira-classic', 'rapira-dispatcher', 'oxphp-classic', 'oxphp-worker', 'swoole', 'apache-mod-php', 'workerman', 'reactphp', 'amphp' => 'app',
             default => $service,
         };
         $second = max(0, (int) floor($timestamp - $firstTimestamp));
@@ -805,28 +807,163 @@ function parseDockerStats(string $dockerStatsFile): array
     return $services;
 }
 
+/** Assign stable colors by run label, independent of input order and chart filtering. */
+function buildRunPalette(array $runs): array
+{
+    $colors = [
+        'FrankenPHP worker' => '#c46060',
+        'RoadRunner v2025' => '#448c18',
+        'RoadRunner v3' => '#0000ee',
+        'Rapira worker' => '#a000c8',
+        'Rapira dispatcher' => '#0078c8',
+        'OxPHP worker' => '#6b4c00',
+        'Swoole' => '#000000',
+        'Workerman' => '#000077',
+        'ReactPHP' => '#002200',
+        'Amp' => '#660055',
+        'Apache + mod_php' => '#111111',
+        'FrankenPHP classic' => '#8f4e20',
+        'PHP-FPM + Nginx' => '#ce2070',
+        'Rapira classic' => '#3b2c85',
+        'FreeUnit' => '#007d34',
+        'OxPHP classic' => '#5666de',
+        'FrankenPHP worker DB' => '#737b89',
+        'RoadRunner v2025 DB' => '#222222',
+        'RoadRunner v3 DB' => '#770088',
+        'Rapira worker DB' => '#d95700',
+        'Rapira dispatcher DB' => '#a50021',
+        'OxPHP worker DB' => '#00538a',
+        'Swoole DB' => '#6600ff',
+        'Workerman DB' => '#ff11ee',
+        'ReactPHP DB' => '#000001',
+        'Amp DB' => '#009900',
+        'Apache + mod_php DB' => '#000011',
+        'FrankenPHP classic DB' => '#9965a5',
+        'PHP-FPM + Nginx DB' => '#d52b2b',
+        'Rapira classic DB' => '#806000',
+        'FreeUnit DB' => '#008a91',
+        'OxPHP classic DB' => '#004d43',
+    ];
+
+    // Optional runtimes get the most distant available color instead of wrapping the palette.
+    $labels = array_unique(array_column($runs, 'label'));
+    sort($labels, SORT_STRING);
+    foreach ($labels as $label) {
+        if (!isset($colors[$label])) {
+            $colors[$label] = nextRunColor(array_values($colors));
+        }
+    }
+
+    $palette = [];
+    foreach ($runs as $index => $run) {
+        $palette[$index] = $colors[$run['label']];
+    }
+    return $palette;
+}
+
+/** Extend the palette by maximizing the minimum perceptual distance in Oklab. */
+function nextRunColor(array $usedColors): string
+{
+    $used = array_map('runColorCoordinates', $usedColors);
+    $bestDistance = -1.0;
+    $bestColor = '#000000';
+    for ($red = 0; $red <= 255; $red += 17) {
+        for ($green = 0; $green <= 255; $green += 17) {
+            for ($blue = 0; $blue <= 255; $blue += 17) {
+                $color = sprintf('#%02x%02x%02x', $red, $green, $blue);
+                [$lightness, $a, $b, $luminance] = runColorCoordinates($color);
+                // At least 3:1 contrast against the report's warm white chart background.
+                if ($luminance > 0.28 || in_array($color, $usedColors, true)) {
+                    continue;
+                }
+                $distance = INF;
+                foreach ($used as [$otherLightness, $otherA, $otherB]) {
+                    $distance = min($distance, ($lightness - $otherLightness) ** 2 + ($a - $otherA) ** 2 + ($b - $otherB) ** 2);
+                }
+                if ($distance > $bestDistance) {
+                    $bestDistance = $distance;
+                    $bestColor = $color;
+                }
+            }
+        }
+    }
+    return $bestColor;
+}
+
+/** @return array{float, float, float, float} Oklab coordinates and relative luminance. */
+function runColorCoordinates(string $color): array
+{
+    $rgb = [];
+    foreach ([1, 3, 5] as $offset) {
+        $channel = hexdec(substr($color, $offset, 2)) / 255;
+        $rgb[] = $channel <= 0.04045 ? $channel / 12.92 : (($channel + 0.055) / 1.055) ** 2.4;
+    }
+    [$r, $g, $b] = $rgb;
+    $l = (0.4122214708 * $r + 0.5363325363 * $g + 0.0514459929 * $b) ** (1 / 3);
+    $m = (0.2119034982 * $r + 0.6806995451 * $g + 0.1073969566 * $b) ** (1 / 3);
+    $s = (0.0883024619 * $r + 0.2817188376 * $g + 0.6299787005 * $b) ** (1 / 3);
+    return [
+        0.2104542553 * $l + 0.7936177850 * $m - 0.0040720468 * $s,
+        1.9779984951 * $l - 2.4285922050 * $m + 0.4505937099 * $s,
+        0.0259040371 * $l + 0.7827717662 * $m - 0.8086757660 * $s,
+        0.2126 * $r + 0.7152 * $g + 0.0722 * $b,
+    ];
+}
+
 function renderHtmlReport(array $runs): string
 {
-    $palette = [
-        '#e6194b', // Red.
-        '#4363d8', // Blue.
-        '#008000', // Green.
-        '#f58200', // Orange.
-        '#911eb4', // Purple.
-        '#009eae', // Cyan.
-        '#000000', // Black.
-        '#b59b00', // Mustard.
-        '#f032e6', // Magenta.
-        '#9a6324', // Brown.
-        '#73a800', // Lime.
-        '#70899f', // Slate.
-    ];
+    $systemDescriptions = [];
+    $runDates = [];
+    $runNotes = [];
+    $contextFiles = array_unique(array_map(
+        static fn(array $run): string => dirname($run['directory']) . '/run-context.json',
+        $runs,
+    ));
+    foreach ($contextFiles as $contextFile) {
+        if (!is_file($contextFile)) {
+            continue;
+        }
+        $context = json_decode(file_get_contents($contextFile), true, 512, JSON_THROW_ON_ERROR);
+        foreach ($context['report_notes'] ?? [] as $note) {
+            $runNotes[] = '<p><strong>Run note (' . h((string) ($context['date'] ?? 'undated')) . ').</strong> '
+                . h($note) . '</p>';
+        }
+        if (isset($context['date'])) {
+            foreach ($runs as $run) {
+                if (dirname($run['directory']) . '/run-context.json' === $contextFile) {
+                    $runDates[$context['date']][] = preg_replace('/ DB$/', '', $run['label']);
+                }
+            }
+        }
+        $details = [];
+        foreach (['os' => 'OS', 'kernel' => 'Kernel', 'cpu' => 'CPU', 'memory' => 'Memory', 'disk' => 'Disk', 'filesystem' => 'Filesystem'] as $key => $label) {
+            if (isset($context['system'][$key])) {
+                $details[] = '<strong>' . $label . ':</strong> ' . h($context['system'][$key]);
+            }
+        }
+        if ($details !== []) {
+            $systemDescriptions[] = '<p><strong>Test system.</strong> ' . implode('; ', $details) . '.</p>';
+        }
+    }
+    $systemDescription = implode("\n      ", array_unique($systemDescriptions));
+    $runNoteDescription = $runNotes === [] ? '' : '<details class="run-notes"><summary>Run notes</summary>'
+        . implode("\n      ", array_unique($runNotes)) . '</details>';
+    ksort($runDates);
+    $dateDescriptions = [];
+    foreach ($runDates as $date => $labels) {
+        $dateDescriptions[] = h((string) $date) . ': ' . h(implode(', ', array_unique($labels)));
+    }
+    $runDateDescription = $dateDescriptions === []
+        ? ''
+        : '<p><strong>Run dates.</strong> ' . implode('; ', $dateDescriptions) . '.</p>';
+
+    $palette = buildRunPalette($runs);
     $allRuns = $runs;
     $groups = [
-        'worker-home' => ['Worker no DB', false, ['FrankenPHP worker', 'RoadRunner', 'Rapira worker', 'Rapira dispatcher']],
-        'worker-db' => ['Worker DB', true, ['FrankenPHP worker', 'RoadRunner', 'Rapira worker', 'Rapira dispatcher']],
-        'non-worker-home' => ['Non-worker no DB', false, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit']],
-        'non-worker-db' => ['Non-worker DB', true, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit']],
+        'worker-home' => ['Worker no DB', false, ['FrankenPHP worker', 'RoadRunner v2025', 'RoadRunner v3', 'Rapira worker', 'Rapira dispatcher', 'OxPHP worker', 'Swoole', 'Workerman', 'ReactPHP', 'Amp']],
+        'worker-db' => ['Worker DB', true, ['FrankenPHP worker', 'RoadRunner v2025', 'RoadRunner v3', 'Rapira worker', 'Rapira dispatcher', 'OxPHP worker', 'Swoole', 'Workerman', 'ReactPHP', 'Amp']],
+        'non-worker-home' => ['Non-worker no DB', false, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit', 'OxPHP classic', 'Apache + mod_php']],
+        'non-worker-db' => ['Non-worker DB', true, ['FrankenPHP classic', 'PHP-FPM + Nginx', 'Rapira classic', 'FreeUnit', 'OxPHP classic', 'Apache + mod_php']],
     ];
     $chartDefinitions = [];
     $included = [];
@@ -877,7 +1014,7 @@ function renderHtmlReport(array $runs): string
             $latencyCells .= '<td data-sort-value="' . ($value ?? '') . '">'
                 . ($value === null ? '—' : formatMilliseconds($value)) . '</td>';
         }
-        $runColor = $palette[$index % count($palette)];
+        $runColor = $palette[$index];
         $runLabel = h($run['label']);
         $summaryRows[isDatabaseRun($run) ? 'db' : 'home'] .= '<tr>'
             . '<td><span class="summary-run"><span class="legend-swatch" style="background:' . h($runColor) . '"></span>' . $runLabel . '</span></td>'
@@ -1121,6 +1258,7 @@ HTML;
       color: var(--muted);
       width: 15%;
     }
+    .summary-table tbody tr:hover { background-color: rgba(37, 99, 235, 0.08); }
     .summary-table th button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; text-align: left; }
     .summary-table th button::after { content: ' ↕'; }
     .summary-table th[aria-sort="ascending"] button::after { content: ' ↑'; }
@@ -1239,6 +1377,9 @@ HTML;
     <section class="panel">
       <h1>Benchmark Report</h1>
       <p>Generated {$generatedAt}. This report combines wrkx stage summaries with Docker CPU and memory samples.</p>
+      {$systemDescription}
+      {$runDateDescription}
+{$runNoteDescription}
       <p>Charts show raw samples. For stage results, RPS cap marks the first stage with successful throughput more than 5% below target; per-second results use a sustained latency surge. The load generator can also limit throughput.</p>
       <p>Hover over a chart legend label or focus it with Tab to highlight that run.</p>
     </section>
@@ -1496,7 +1637,7 @@ HTML;
       // Draw the highlighted run last so overlapping lines cannot hide it.
       const orderedSeries = [...displaySeries].sort((a, b) => Number(isHighlighted(a)) - Number(isHighlighted(b)));
 
-      // Keep issued rates above the response-based scale inside the plot area.
+      // Target and error rates may exceed the scale based on successful responses.
       ctx.save();
       ctx.beginPath();
       ctx.rect(margin.left, margin.top, width, height);
@@ -1507,7 +1648,7 @@ HTML;
           drawLine(ctx, toCanvasX, toCanvasY, item.points, item.color, item.dash, 1.2, 0.22 * opacity(item));
         }
 
-        drawLine(ctx, toCanvasX, toCanvasY, item.displayPoints, item.color, item.dash, isHighlighted(item) ? 4 : 2.2, opacity(item));
+        drawLine(ctx, toCanvasX, toCanvasY, item.displayPoints, item.color, item.dash, isHighlighted(item) ? 4 : 2.2, opacity(item), item.stepped);
 
         ctx.save();
         ctx.globalAlpha = opacity(item);
@@ -1614,7 +1755,7 @@ HTML;
       });
     }
 
-    function drawLine(ctx, toCanvasX, toCanvasY, points, color, dash, lineWidth, alpha) {
+    function drawLine(ctx, toCanvasX, toCanvasY, points, color, dash, lineWidth, alpha, stepped = false) {
       ctx.save();
       ctx.beginPath();
       ctx.strokeStyle = color;
@@ -1632,6 +1773,9 @@ HTML;
         if (index === 0) {
           ctx.moveTo(x, y);
         } else {
+          if (stepped) {
+            ctx.lineTo(x, toCanvasY(points[index - 1].y));
+          }
           ctx.lineTo(x, y);
         }
       });
@@ -1759,14 +1903,14 @@ function buildChartDefinitions(array $runs, array $palette): array
             'id' => 'requests-per-second',
             'title' => 'Request Rate Per Second',
             'series' => array_merge(
-                collectRunSeries($runs, 'issuedRequestsPerSecond', $palette, ' issued', false, [2, 4]),
+                collectRunSeries($runs, 'targetRequestsPerSecond', $palette, ' target', false, [2, 4]),
                 withStartMarkers(collectRunSeries($runs, 'successfulResponsesPerSecond', $palette, ' successful')),
                 collectRunSeries($runs, 'erroredRequestsPerSecond', $palette, ' errored', false, [8, 4]),
             ),
             'xAxisTargetSeries' => collectRunSeries($runs, 'targetRequestsPerSecond', $palette),
             'styleLegend' => [
                 ['label' => 'successful', 'dash' => []],
-                ['label' => 'issued', 'dash' => [2, 4]],
+                ['label' => 'target', 'dash' => [2, 4]],
                 ['label' => 'errored', 'dash' => [8, 4]],
             ],
             'format' => 'integer',
@@ -1841,9 +1985,10 @@ function collectRunSeries(
         $series[] = [
             'label' => $run['label'] . $labelSuffix,
             'runLabel' => $run['label'],
-            'color' => $palette[$index % count($palette)],
+            'color' => $palette[$index],
             'runIndex' => $index,
-            'affectsYAxis' => $metric !== 'issuedRequestsPerSecond',
+            'affectsYAxis' => !in_array($metric, ['targetRequestsPerSecond', 'erroredRequestsPerSecond'], true),
+            'stepped' => $metric === 'targetRequestsPerSecond',
             'points' => $points,
             'showPoints' => $showPoints,
             'dash' => $dash,
@@ -1898,7 +2043,7 @@ function collectDockerSeries(array $runs, string $serviceName, string $metric, a
         $series[] = [
             'label' => $run['label'],
             'runLabel' => $run['label'],
-            'color' => $palette[$index % count($palette)],
+            'color' => $palette[$index],
             'points' => $points,
             'capSecond' => (($run['summary']['rpsCap']['reached'] ?? false) === true)
                 ? (int) ($run['summary']['rpsCap']['second'] ?? 0)

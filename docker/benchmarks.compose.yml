@@ -60,6 +60,96 @@ services:
     env_file: [dev/.env]
     depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
 
+  roadrunner-v3:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/') === false ? 1 : 0);"]
+    profiles: [roadrunner-v3]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: roadrunner-v3
+    ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  swoole:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/') === false ? 1 : 0);"]
+    profiles: [swoole]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: swoole
+    ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  workerman:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/') === false ? 1 : 0);"]
+    profiles: [workerman]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: workerman
+    ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  reactphp:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/') === false ? 1 : 0);"]
+    profiles: [reactphp]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: reactphp
+    ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  amphp:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:8080/') === false ? 1 : 0);"]
+    profiles: [amphp]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: amphp
+    ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  apache-mod-php:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:80/') === false ? 1 : 0);"]
+    profiles: [apache-mod-php]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: apache-mod-php
+    ports: ["9991:80"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
   php:
     <<: *runtime
     healthcheck:
@@ -125,7 +215,7 @@ services:
       context: ..
       dockerfile: docker/runtimes/Dockerfile
       target: rapira
-    command: ["rapira", "serve", "--config", "docker/runtimes/rapira-classic.toml"]
+    command: ["rapira", "serve", "docker/runtimes/rapira-classic.toml"]
     ports: ["9991:8080"]
     volumes: ["../:/app"]
     env_file: [dev/.env]
@@ -141,8 +231,38 @@ services:
       context: ..
       dockerfile: docker/runtimes/Dockerfile
       target: rapira
-    command: ["rapira", "serve", "--config", "docker/runtimes/rapira-dispatcher.toml"]
+    command: ["rapira", "serve", "docker/runtimes/rapira-dispatcher.toml"]
     ports: ["9991:8080"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  oxphp-classic:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:80/') === false ? 1 : 0);"]
+    profiles: [oxphp-classic]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: oxphp-classic
+    ports: ["9991:80"]
+    volumes: ["../:/app"]
+    env_file: [dev/.env]
+    depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
+
+  oxphp-worker:
+    <<: *runtime
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:80/') === false ? 1 : 0);"]
+    profiles: [oxphp-worker]
+    build:
+      context: ..
+      dockerfile: docker/runtimes/Dockerfile
+      target: oxphp-worker
+    ports: ["9991:80"]
     volumes: ["../:/app"]
     env_file: [dev/.env]
     depends_on: {postgres: {condition: service_healthy}, valkey: {condition: service_healthy}}
@@ -156,7 +276,7 @@ services:
   postgres:
     <<: *runtime
     image: postgres:18.6-alpine
-    command: -c max_connections=200
+    command: -c max_connections=2000
     environment: {POSTGRES_DB: benchmark, POSTGRES_USER: benchmark, POSTGRES_PASSWORD: benchmark}
     healthcheck: {test: ["CMD-SHELL", "pg_isready -U benchmark -d benchmark"], interval: 2s, timeout: 2s, retries: 30}
     volumes: ["./postgres/initdb.d:/docker-entrypoint-initdb.d:ro"]
